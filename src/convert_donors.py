@@ -1,12 +1,23 @@
 """
 Airtable Donor CSV Converter
-Converts from legacy Airtable export format to new CRM format.
+Converts from development Airtable export format to prospecting format.
 
-Usage:
+Usage (via launcher):
+    Open main.py, select this script, and choose your input file.
+
+Usage (command line):
     python convert_donors.py
 
 All file names are configured in the CONFIG section below.
-The output file is always written fresh — never edited.
+See the following for properly formatted examples:
+    examples/convert_donors_donor_check_sample.csv
+    examples/convert_donors_input_sample.csv
+    examples/convert_donors_output_sample.csv
+
+Input is from the Contacts table of the Development Base.
+Donor check: if a row's 'Donor Check' value is not '#N/A', the donor has
+already given and is skipped for prospecting.
+The output file can be imported directly into the prospecting table.
 """
 
 import csv
@@ -15,9 +26,10 @@ from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # CONFIG — edit these lines as needed.
-# All files must be in the same folder as this script.
+# When run via the launcher, INPUT_FILE is replaced by the file you pick.
+# OUTPUT_FILE and DONOR_CHECK_FILE are resolved relative to the input file.
 # ---------------------------------------------------------------------------
-INPUT_FILE       = "input.csv"        # <-- your Airtable export
+INPUT_FILE       = "input.csv"        # <-- your Airtable export (CLI fallback)
 OUTPUT_FILE      = "output.csv"       # <-- written fresh every run
 DONOR_CHECK_FILE = "donor_check.csv"  # <-- set to None to process all rows
 BATCH_SIZE       = None               # <-- e.g. 100 to split into batches, or None
@@ -74,28 +86,27 @@ OUTPUT_COLUMNS = [
 # Donor check filter
 # ---------------------------------------------------------------------------
 
-def load_unprocessed_names(script_dir: Path) -> set | None:
+def load_unprocessed_names(working_dir: Path) -> set | None:
     """
     Load the donor-check CSV and return a set of names (lowercase) that
     should be processed — those whose 'Donor Check' value is '#N/A'.
-    Returns None if DONOR_CHECK_FILE is not set or file doesn't exist
-    (all rows processed in that case).
+    Returns None if DONOR_CHECK_FILE is not set or the file doesn't exist
+    (all rows are processed in that case).
     """
     if not DONOR_CHECK_FILE:
         return None
 
-    check_path = script_dir / DONOR_CHECK_FILE
+    check_path = working_dir / DONOR_CHECK_FILE
     if not check_path.exists():
-        print(f"WARNING: Donor check file '{DONOR_CHECK_FILE}' not found in {script_dir}.")
+        print(f"WARNING: Donor check file '{DONOR_CHECK_FILE}' not found in {working_dir}.")
         print("         Proceeding without donor filter — all rows will be processed.\n")
         return None
 
-    allowed = set()
+    allowed        = set()
     skipped_donors = []
 
     with open(check_path, newline="", encoding="latin-1") as f:
         reader = csv.DictReader(f)
-        # Handle BOM on first header key
         fieldnames = [k.lstrip("\ufeff") for k in (reader.fieldnames or [])]
         reader.fieldnames = fieldnames
 
@@ -126,7 +137,7 @@ def normalize(value: str) -> str:
 
 
 def is_individual(institution: str) -> bool:
-    """Return True if the institution value indicates an individual donor.
+    """Return True when the institution field indicates an individual donor.
     Handles values like '[individual]', 'individual', or blank."""
     val = normalize(institution).strip("[]")
     return not val or val == "individual"
@@ -170,7 +181,7 @@ def map_lookup(raw: str, lookup: dict, field_name: str, row_num: int, issues: li
             f"  Row {row_num}: Unrecognised {field_name} '{raw.strip()}' — copied as-is."
         )
         return raw.strip()
-    return default  # return default when value is blank
+    return default
 
 # ---------------------------------------------------------------------------
 # Core conversion
@@ -181,12 +192,9 @@ def convert_row(row: dict, row_num: int, issues: list) -> dict:
 
     donor_type   = map_donor_type(institution)
     donor_market = map_donor_market(row.get("Donor Market", ""), row_num, issues)
-
-    # Default stewardship to 1 - Identification when blank
     stewardship  = map_lookup(row.get("Stewardship Stage", ""), STEWARDSHIP_MAP,
                               "Stewardship Stage", row_num, issues,
                               default="1 - Identification")
-
     priority     = map_lookup(row.get("Priority Level", ""), PRIORITY_MAP,
                               "Priority Level", row_num, issues)
 
@@ -236,19 +244,19 @@ def write_output(rows: list, output_path: Path):
             print(f"  Written: {path}  ({len(batch)} rows)")
 
 # ---------------------------------------------------------------------------
-# Entry point
+# Core logic (shared by run() and main())
 # ---------------------------------------------------------------------------
 
-def main():
-    script_dir  = Path(__file__).parent
-    input_path  = script_dir / INPUT_FILE
-    output_path = script_dir / OUTPUT_FILE
+def _run(input_path: Path):
+    """Run the conversion given a resolved input Path."""
+    working_dir = input_path.parent
+    output_path = working_dir / OUTPUT_FILE
 
     if not input_path.exists():
         print(f"ERROR: Input file not found: {input_path}")
         sys.exit(1)
 
-    unprocessed = load_unprocessed_names(script_dir)
+    unprocessed = load_unprocessed_names(working_dir)
 
     output_rows = []
     all_issues  = []
@@ -259,8 +267,6 @@ def main():
 
     with open(input_path, newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
-
-        # BOM already stripped by utf-8-sig encoding
 
         expected_input_cols = {
             "Name", "Donor Status", "Donor Market", "Stewardship Stage",
@@ -277,11 +283,9 @@ def main():
         for row_num, row in enumerate(reader, start=2):
             try:
                 name = row.get("Name", "").strip()
-
                 if unprocessed is not None and name.lower() not in unprocessed:
                     filtered += 1
                     continue
-
                 output_rows.append(convert_row(row, row_num, all_issues))
             except Exception as exc:
                 skipped += 1
@@ -303,6 +307,22 @@ def main():
           f"({filtered} filtered as existing donors, {skipped} skipped due to errors)...")
     write_output(output_rows, output_path)
     print("\nDone.\n")
+
+# ---------------------------------------------------------------------------
+# Launcher entry point
+# ---------------------------------------------------------------------------
+
+def run(input_file: str):
+    """Called by main.py. Accepts the path to the input CSV as a string."""
+    _run(Path(input_file))
+
+# ---------------------------------------------------------------------------
+# Command-line entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    script_dir = Path(__file__).parent
+    _run(script_dir / INPUT_FILE)
 
 
 if __name__ == "__main__":
