@@ -38,7 +38,6 @@ REQUEST_DELAY = 0.25
 
 # Field IDs — used when WRITING records to Airtable (create / update calls).
 FIELD_IDS: dict[str, str] = {
-    "Name":                       "fldJDAn24IkdBz602",
     "Principal First":            "fldxtrz1GfFLPSECr",
     "Principal Last":             "fld3imK3izgq6GSJT",
     "Email":                      "fldou36sB8VLuUgVh",
@@ -144,9 +143,6 @@ def _build_fields(row: dict, *, existing_record: dict | None = None) -> dict:
     location_parts = [p for p in (city, state) if p]
     location = ", ".join(location_parts)
 
-    # Compose full name
-    name = f"{first_name} {last_name}".strip()
-
     # ── Email logic ───────────────────────────────────────────────────────────
     # Primary:    Personal email 1
     # Additional: Personal email 2, Personal email 3, Business email 1
@@ -170,24 +166,25 @@ def _build_fields(row: dict, *, existing_record: dict | None = None) -> dict:
     if existing_record is not None:
         # Only fill email fields when currently blank in Airtable.
         existing_fields = existing_record.get("fields", {})
-        primary_email    = new_primary    if not existing_fields.get(FIELD_NAMES["Email"])             else ""
-        additional_email = new_additional if not existing_fields.get(FIELD_NAMES["Additional Emails"]) else ""
+        primary_email    = new_primary    if not\
+            existing_fields.get(FIELD_NAMES["Email"])             else ""
+        additional_email = new_additional if not\
+            existing_fields.get(FIELD_NAMES["Additional Emails"]) else ""
     else:
         primary_email    = new_primary
         additional_email = new_additional
 
     # ── Assemble fields dict ──────────────────────────────────────────────────
-    # Note: Name, Principal First/Last, and Location intentionally overwrite
+    # Note: Principal First/Last and Location intentionally overwrite
     # existing Airtable values — WealthEngine data is treated as authoritative
     # for these fields. Only emails are protected from overwrite.
-    fields: dict[str, str] = {
-        FIELD_IDS["Name"]:                       name,
+    fields: dict[str, str | int] = {
         FIELD_IDS["Principal First"]:            first_name,
         FIELD_IDS["Principal Last"]:             last_name,
         FIELD_IDS["Location (city, state)"]:     location,
-        FIELD_IDS["Wealth Score"]:               _col(row, "WealthScore"),
-        FIELD_IDS["P2G Score 1"]:                _col(row, "P2G Score (first digit)"),
-        FIELD_IDS["P2G Score 2"]:                _col(row, "P2G Score (second digit)"),
+        FIELD_IDS["Wealth Score"]:               int(_col(row, "WealthScore")),
+        FIELD_IDS["P2G Score 1"]:                int(_col(row, "P2G Score (first digit)")),
+        FIELD_IDS["P2G Score 2"]:                int(_col(row, "P2G Score (second digit)")),
         FIELD_IDS["Estimated Annual Donations"]: _col(row, "Estimated Annual Donations"),
         FIELD_IDS["Gift Capacity Range"]:        _col(row, "Gift Capacity Range"),
         FIELD_IDS["Charitable Donations"]:       _col(row, "Charitable Donations"),
@@ -312,7 +309,8 @@ def write_new_records_file() -> None:
 
     The file contains two kinds of entries:
       "First Last"                   — a new record was created; verify no manual dupe exists
-      "First Last - Duplicate names" — multiple Airtable records matched; a new one was still created
+      "First Last - Duplicate names" — multiple Airtable records matched;
+       a new one was still created
     """
     with open("new_records.txt", "w", encoding="utf-8") as f:
         f.write("# New records created this run\n")

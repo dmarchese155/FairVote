@@ -6,7 +6,7 @@ Usage (via launcher):
     Open main.py, select this script, and choose your input file.
 
 Usage (command line):
-    python givebutter_to_wealthengine_individuals.py
+    python givebutter_to_wealthengine.py
 
 The input file is configured in the CONFIG section below.
 Two output files are always written next to the input file:

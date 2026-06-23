@@ -1,7 +1,7 @@
 [project]
 name = "fairvote"
 version = "0.1.0"
-description = "Add your description here"
+description = "Scripts for FairVote to make things run easier."
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
@@ -19,4 +19,3 @@ dev = [
 
 [tool.mypy]
 strict = false
-ignore_missing_stubs = true
