@@ -81,7 +81,7 @@ SANS        = ("Segoe UI", "Helvetica Neue", "Arial")
 class LauncherApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Script Launcher")
+        self.title("FairVote Script Launcher")
         self.configure(bg=BG)
         self.minsize(680, 560)
         self.resizable(True, True)
@@ -102,7 +102,7 @@ class LauncherApp(tk.Tk):
         header.pack(fill="x")
 
         tk.Label(
-            header, text="Script Launcher",
+            header, text="FairVote Script Launcher",
             bg=ACCENT, fg="white",
             font=(SANS[0], 18, "bold")
         ).pack(side="left")
