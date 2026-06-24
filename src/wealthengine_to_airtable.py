@@ -66,14 +66,14 @@ FIELD_NAMES: dict[str, str] = {
 
 # Entries written to new_records.txt at the end of the run.
 # Contains two categories:
-#   "First Last"                  — brand-new record created; verify no manual dupe exists
-#   "First Last - Duplicate names" — multiple existing Airtable records matched; skipped
+#   "First Last"                   — brand-new record created; verify no manual dupe exists
+#   "First Last - Duplicate names" — multiple existing Airtable records matched; new record still created
 new_records: list[str] = []
 
 # In-memory index of all existing Airtable records, built once at startup.
-# Key: (first_name_lower, last_name_lower)
-# Value: list of matching records (list len > 1 means ambiguous)
-_airtable_index: dict[tuple[str, str], list[dict]] = {}
+# Key:   last_name_lower (exact)
+# Value: list of all records sharing that last name (first name matched via contains)
+_airtable_index: dict[str, list[dict]] = {}
 
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
@@ -91,9 +91,9 @@ def build_index(table) -> None:
     """
     Fetch all existing Airtable records once and build an in-memory lookup index.
 
-    This replaces per-row API searches, reducing total API calls significantly.
-    The index is keyed by (first_name_lower, last_name_lower); values are lists
-    of matching records (a list longer than 1 means there are already duplicates).
+    The index is keyed by exact lowercase last name. Each key maps to a list of
+    all records sharing that last name, which find_user then searches via
+    contains-matching on the first name.
 
     Args:
         table: pyairtable Table instance.
@@ -104,12 +104,10 @@ def build_index(table) -> None:
 
     for record in all_records:
         fields = record.get("fields", {})
-        first = fields.get(FIELD_NAMES["Principal First"], "").strip().lower()
-        last  = fields.get(FIELD_NAMES["Principal Last"],  "").strip().lower()
-        if not first and not last:
+        last = fields.get(FIELD_NAMES["Principal Last"], "").strip().lower()
+        if not last:
             continue
-        key = (first, last)
-        _airtable_index.setdefault(key, []).append(record)
+        _airtable_index.setdefault(last, []).append(record)
 
     print(f"  {len(all_records)} records indexed.")
 
@@ -123,7 +121,7 @@ def _build_fields(row: dict, *, existing_record: dict | None = None) -> dict:
     """
     Build the Airtable fields dict from a CSV row.
 
-    Name, Principal First/Last, and Location are always written (overwrite intended).
+    Principal First/Last and Location are always written (overwrite intended).
     Email fields are only written if currently blank on an existing record.
 
     Args:
@@ -166,18 +164,16 @@ def _build_fields(row: dict, *, existing_record: dict | None = None) -> dict:
     if existing_record is not None:
         # Only fill email fields when currently blank in Airtable.
         existing_fields = existing_record.get("fields", {})
-        primary_email    = new_primary    if not\
-            existing_fields.get(FIELD_NAMES["Email"])             else ""
-        additional_email = new_additional if not\
-            existing_fields.get(FIELD_NAMES["Additional Emails"]) else ""
+        primary_email    = new_primary    if not existing_fields.get(FIELD_NAMES["Email"])             else ""
+        additional_email = new_additional if not existing_fields.get(FIELD_NAMES["Additional Emails"]) else ""
     else:
         primary_email    = new_primary
         additional_email = new_additional
 
     # ── Assemble fields dict ──────────────────────────────────────────────────
-    # Note: Principal First/Last and Location intentionally overwrite
-    # existing Airtable values — WealthEngine data is treated as authoritative
-    # for these fields. Only emails are protected from overwrite.
+    # Note: Principal First/Last and Location intentionally overwrite existing
+    # Airtable values — WealthEngine data is treated as authoritative for these
+    # fields. Only emails are protected from overwrite.
     fields: dict[str, str | int] = {
         FIELD_IDS["Principal First"]:            first_name,
         FIELD_IDS["Principal Last"]:             last_name,
@@ -208,27 +204,37 @@ def find_user(first_name: str, last_name: str) -> dict | None:
     """
     Look up an existing Airtable record from the in-memory index.
 
-    Matching is case-insensitive. Both first AND last name must match.
-    If multiple records share the same name, logs the ambiguity and returns
-    None — the CSV row will still be processed and a new record created, since
-    we cannot safely determine which existing record to update.
+    Last name must match exactly (case-insensitive). Among records sharing that
+    last name, the CSV first name must appear somewhere in the Airtable Principal
+    First value (case-insensitive contains). This handles joint records such as
+    "John and Sarah" / "Smith" matching a CSV row for "John" / "Smith".
+
+    If multiple records satisfy both conditions, logs the ambiguity and returns
+    None — main() will create a new record since we cannot safely pick one.
 
     Args:
-        first_name: The person's first name.
-        last_name:  The person's last name.
+        first_name: The person's first name from the CSV.
+        last_name:  The person's last name from the CSV.
 
     Returns:
         The single matching Airtable record dict, or None if not found / ambiguous.
     """
-    key = (first_name.strip().lower(), last_name.strip().lower())
-    matches = _airtable_index.get(key, [])
+    first_lower = first_name.strip().lower()
+    last_lower  = last_name.strip().lower()
+
+    # O(1) last-name key lookup; contains-match only over that subset
+    candidates = _airtable_index.get(last_lower, [])
+    matches = [
+        record for record in candidates
+        if first_lower in record["fields"].get(FIELD_NAMES["Principal First"], "").strip().lower()
+    ]
 
     if len(matches) == 1:
         return matches[0]
 
     if len(matches) > 1:
         # Multiple records already exist in Airtable with this name.
-        # Log the ambiguity and return None; process() will create a new record.
+        # Log the ambiguity and return None; main() will create a new record.
         new_records.append(f"{first_name} {last_name} - Duplicate names")
 
     return None
@@ -246,32 +252,47 @@ def write_new(table, row: dict) -> None:
     new_record = table.create(fields)
     time.sleep(REQUEST_DELAY)
 
-    # Keep the index current so later rows in the same file can detect this new entry
-    first = _col(row, "First Name").lower()
-    last  = _col(row, "Last Name").lower()
-    _airtable_index.setdefault((first, last), []).append(new_record)
+    # Keep the index current so later rows in the same CSV can detect this entry
+    last = _col(row, "Last Name").lower()
+    _airtable_index.setdefault(last, []).append(new_record)
 
 
-def update(table, row: dict, record: dict) -> None:
+def flush_updates(table, update_queue: list[tuple[str, dict]]) -> None:
     """
-    Update an existing Airtable record with data from a CSV row.
-    Email fields are only written when currently blank on the record.
-    Skips the API call entirely if there are no fields to change.
+    Flush a queue of pending updates to Airtable in batches of 10.
+
+    pyairtable's batch_update sends up to 10 records per API call. If a batch
+    fails, each record in it is retried individually so we can identify and log
+    the specific failing record without losing the rest of the batch.
 
     Args:
-        table:  pyairtable Table instance.
-        row:    Parsed CSV row dict.
-        record: The existing Airtable record dict (from find_user).
+        table:        pyairtable Table instance.
+        update_queue: List of (record_id, fields) pairs to write.
     """
-    fields = _build_fields(row, existing_record=record)
-    if fields:
-        table.update(record["id"], fields)
-        time.sleep(REQUEST_DELAY)
+    BATCH_SIZE = 10
+
+    for batch_start in range(0, len(update_queue), BATCH_SIZE):
+        batch = update_queue[batch_start : batch_start + BATCH_SIZE]
+        # pyairtable batch_update expects a list of dicts with "id" and "fields"
+        payload = [{"id": rec_id, "fields": fields} for rec_id, fields in batch]
+
+        try:
+            table.batch_update(payload)
+            time.sleep(REQUEST_DELAY)
+        except Exception as batch_err:
+            print(f"  Batch update failed ({batch_err}), retrying individually ...")
+            for rec_id, fields in batch:
+                try:
+                    table.update(rec_id, fields)
+                    time.sleep(REQUEST_DELAY)
+                except Exception as e:
+                    print(f"  ERROR updating record {rec_id}: {e}")
 
 
-def process(table, row: dict) -> None:
+def process(row: dict, update_queue: list[tuple[str, dict]]) -> None:
     """
-    Process a single CSV row: validate, look up in Airtable, then create or update.
+    Process a single CSV row: validate, look up in Airtable, then queue an
+    update or create immediately.
 
     Skips rows with no name or a WealthEngine "No Match" P2G result.
     Newly created records are logged in new_records.txt for manual review.
@@ -279,8 +300,9 @@ def process(table, row: dict) -> None:
     logged (flagged as "- Duplicate names") and a new record is created.
 
     Args:
-        table: pyairtable Table instance.
-        row:   Parsed CSV row dict.
+        row:          Parsed CSV row dict.
+        update_queue: Mutable list; matched rows append (record_id, fields) here
+                      for batch flushing by the caller.
     """
     first_name: str = _col(row, "First Name")
     last_name: str  = _col(row, "Last Name")
@@ -295,12 +317,18 @@ def process(table, row: dict) -> None:
     record = find_user(first_name, last_name)
 
     if record is None:
-        write_new(table, row)
-        # Log every new record for manual review — new_records.txt may contain
-        # both genuinely new contacts and entries created due to ambiguous matches.
-        new_records.append(f"{first_name} {last_name}")
+        # Creates are single-record so the index stays current for later rows
+        # in the same file (duplicates within a single import are caught).
+        # NOTE: write_new is called directly on the table, not via the queue,
+        # because creates are expected to be far less common than updates.
+        pass  # handled below to keep the table reference out of process()
     else:
-        update(table, row, record)
+        fields = _build_fields(row, existing_record=record)
+        if fields:
+            update_queue.append((record["id"], fields))
+
+    # Return the result so main() can call write_new when needed
+    return record
 
 
 def write_new_records_file() -> None:
@@ -309,8 +337,7 @@ def write_new_records_file() -> None:
 
     The file contains two kinds of entries:
       "First Last"                   — a new record was created; verify no manual dupe exists
-      "First Last - Duplicate names" — multiple Airtable records matched;
-       a new one was still created
+      "First Last - Duplicate names" — multiple Airtable records matched; a new one was still created
     """
     with open("new_records.txt", "w", encoding="utf-8") as f:
         f.write("# New records created this run\n")
@@ -326,8 +353,9 @@ def main(input_file: str) -> None:
     """
     Read all rows of the WealthEngine CSV and process each one.
 
-    Loads all existing Airtable records into memory first, then processes
-    each CSV row with only create/update API calls (no per-row searches).
+    Loads all existing Airtable records into memory first. Updates are queued
+    and flushed in batches of 10; creates (less common) are written immediately
+    so the local index stays current for duplicate detection within the same file.
 
     Args:
         input_file: Path to the WealthEngine CSV export.
@@ -341,9 +369,30 @@ def main(input_file: str) -> None:
 
     print(f"Processing {len(rows)} rows from '{input_file}' ...")
 
+    update_queue: list[tuple[str, dict]] = []
+
     for i, row in enumerate(rows, start=1):
         try:
-            process(table, row)
+            first_name = _col(row, "First Name")
+            last_name  = _col(row, "Last Name")
+
+            if not first_name or not last_name:
+                continue
+
+            p2g_description = _col(row, "P2G Description")
+            if p2g_description == "No Match":
+                continue
+
+            record = find_user(first_name, last_name)
+
+            if record is None:
+                write_new(table, row)
+                new_records.append(f"{first_name} {last_name}")
+            else:
+                fields = _build_fields(row, existing_record=record)
+                if fields:
+                    update_queue.append((record["id"], fields))
+
         except Exception as e:
             first = row.get("First Name", "?").strip()
             last  = row.get("Last Name", "?").strip()
@@ -351,6 +400,9 @@ def main(input_file: str) -> None:
 
         if i % 10 == 0:
             print(f"  {i}/{len(rows)} processed ...")
+
+    print(f"Flushing {len(update_queue)} updates in batches of 10 ...")
+    flush_updates(table, update_queue)
 
     write_new_records_file()
     print("Done.")

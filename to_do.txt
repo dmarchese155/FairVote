@@ -1,3 +1,0 @@
-Update Name Matching in wealthengine_to_airtable.pyairtable
-It should be inclusive, not exact.
-Then, we should be good with what needs to be done and can present to brandon.
